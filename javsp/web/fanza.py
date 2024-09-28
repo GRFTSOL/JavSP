@@ -7,11 +7,10 @@ import logging
 from typing import Dict, List, Tuple
 
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from javsp.web.base import Request, resp2html
 from javsp.web.exceptions import *
-from javsp.core.config import cfg
-from javsp.core.datatype import MovieInfo
+from javsp.config import Cfg
+from javsp.datatype import MovieInfo
 
 
 logger = logging.getLogger(__name__)
@@ -146,7 +145,7 @@ def parse_videoa_page(movie: MovieInfo, html):
         score_img = container.xpath("//td[text()='平均評価：']/following-sibling::td/img/@src")[0]
         movie.score = int(score_img.split('/')[-1].split('.')[0]) # 00, 05 ... 50
     
-    if cfg.Crawler.hardworking_mode:
+    if Cfg().crawler.hardworking:
         # 预览视频是动态加载的，不在静态网页中
         video_url = f'{base_url}/service/digitalapi/-/html5_player/=/cid={movie.cid}'
         html2 = request.get_html(video_url)

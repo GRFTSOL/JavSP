@@ -2,7 +2,7 @@
 import re
 import sys
 
-from javsp.web.base import *
+from javsp.web.base import is_connectable, get_html, get_resp_text, request_get
 
 
 def get_proxy_free_url(site_name: str, prefer_url=None) -> str:
