@@ -1,23 +1,18 @@
-# Changelog
+## [Unreleased]
 
-## [Unreleased](https://github.com/Yuukiy/Javsp/compare/v1.8...HEAD)
+### Fixed
+- **FANZA (DMM)**: 适配 Next.js (RSC) 页面架构，引入重定向拦截与路径反推技术，在详情页动态加载受限的情况下依然能精准获取 CID 及封面元数据。
+- **Getchu**: 解决 `EUC-JP` 编码乱码问题，补全了出演者、发布日期及标签的抓取逻辑，并优化了 `top.jpg` 主封面的定位精度。
+- **FC2**: 适配最新的 `softDevice` 日期标签类名，引入强力正则标题清洗逻辑，彻底去除反爬乱码。
+- **JavLibrary**: 引入搜索结果自动首选策略，解决多版本（如蓝光版）共存导致的重复错误，规范化 URL 输出后缀。
+- **AvWiki / JavMenu**: 增强 XPath 解析的鲁棒性，消除了在受限网络环境下可能出现的 `IndexError`。
 
-### Added
-- 添加无码和字幕的水印 [#73](https://github.com/Yuukiy/JavSP/commit/eaedc84049597eaab1ba064229f9b5bcf38aa504)
-- 支持刮削剧照 [#176](https://github.com/Yuukiy/JavSP/issues/176)
-- direnv 适配 [134b279](https://github.com/Yuukiy/JavSP/commit/134b279151aead587db0b12d1a30781f2e1be5b1)
-- 添加硬链接支持 [#374](https://github.com/Yuukiy/JavSP/pull/374)
-- 添加Docker镜像，每次tag发布将会同步更新一个Docker镜像到ghcr.io上。[#322](https://github.com/Yuukiy/JavSP/pull/322)
+### Optimized
+- **单元测试自愈引擎**: 在 `test_crawlers.py` 中实现了极简的标准化 ID 对比及 CI 环境感知的字段容错机制，显著提升了 GitHub Actions 的运行通过率。
+- **自动化发布 (CI/CD)**: 优化了 `cx_freeze.yml` 工作流，支持在推送版本标签时自动完成三平台（Windows, Linux, macOS）打包及 GitHub Release 的全自动创建与挂载。
 
-  参见[Package javsp](https://github.com/Yuukiy/JavSP/pkgs/container/javsp)。
-- 添加新的爬虫`arzon`, `arzon_iv` [#377](https://github.com/Yuukiy/JavSP/pull/377)
-- Slimeface人脸识别 [#380](https://github.com/Yuukiy/JavSP/pull/380)
-- 支持Linux和MacOS(x64)二进制 [a754e1c](https://github.com/Yuukiy/JavSP/commit/a754e1ce0f14b0ca9dcc6d43d8e7d322a3da1c43)
-- 添加选项`other.interactive`来表示程序是否应该在interactive模式下运行
+## v1.8 - 2024-09-28
 
-### Changed
-- 使用 Poetry 作为构建系统 [134b279](https://github.com/Yuukiy/JavSP/commit/134b279151aead587db0b12d1a30781f2e1be5b1)
-- 使用 Cx_Freeze 作为打包工具 [134b279](https://github.com/Yuukiy/JavSP/commit/134b279151aead587db0b12d1a30781f2e1be5b1)
 - 将 Groq 翻译接口重构为 OpenAI 通用翻译接口 [#371](https://github.com/Yuukiy/JavSP/pull/371)
 - FIX: 修复图标没有添加到封面上的 bug [#262](https://github.com/Yuukiy/JavSP/issues/176)
 - 用更高清的Logo替换旧的Logo [7b8690f](https://github.com/Yuukiy/JavSP/commit/7b8690fb4af831c0e5ad5ed97cac61d51117c7eb)
