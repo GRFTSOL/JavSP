@@ -13,11 +13,20 @@ on:
 
 jobs:
   build:
-    name: Build binaries on ${{ matrix.os }}
+    name: Build binaries on ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-13]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            suffix: tar.gz
+          - os: windows-latest
+            platform: windows
+            suffix: zip
+          - os: macos-latest
+            platform: macos
+            suffix: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -50,20 +59,20 @@ jobs:
         run: echo "VERSION=$(poetry run python tools/version.py)" >> $GITHUB_ENV
 
       - name: Package Artifacts (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.platform == 'windows'
         run: |
           powershell Compress-Archive -Path dist\* -DestinationPath JavSP-${{ env.VERSION }}-windows-x64.zip
 
       - name: Package Artifacts (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+        if: matrix.platform != 'windows'
         run: |
           cd dist
-          tar -czvf ../JavSP-${{ env.VERSION }}-${{ matrix.os == 'ubuntu-latest' && 'linux' || 'macos' }}-x64.tar.gz .
+          tar -czvf ../JavSP-${{ env.VERSION }}-${{ matrix.platform }}-${{ matrix.platform == 'macos' && 'arm64' || 'x64' }}.tar.gz .
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JavSP-${{ env.VERSION }}-${{ matrix.os }}
+          name: JavSP-${{ env.VERSION }}-${{ matrix.platform }}
           path: |
             *.zip
             *.tar.gz
@@ -86,12 +95,10 @@ jobs:
         id: extract_changelog
         shell: bash
         run: |
-          # 提取 ## [Unreleased] 到下一个 ## 之间的内容
-          # 如果是正式发布，通常我们会把 Unreleased 改名为版本号，
-          # 这里我们提取最顶部的更新块（假设 Unreleased 包含最新改动）
+          # 提取 [Unreleased] 下方的更新内容
           changelog=$(sed -n '/## \[Unreleased\]/,/## v/p' CHANGELOG.md | sed '1d;$d')
           if [ -z "$changelog" ]; then
-            # 备选：如果 Unreleased 为空，尝试提取第一个版本号下的内容
+            # 备选：提取最近一个版本号的内容
             changelog=$(sed -n '/## v/,/## v/p' CHANGELOG.md | sed '$d')
           fi
           echo "BODY<<EOF" >> $GITHUB_OUTPUT
