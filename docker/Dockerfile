@@ -2,19 +2,14 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-ENV PATH=/root/.local/bin:$PATH
-RUN pip install pipx && \
-    pipx ensurepath && \
-    pipx install poetry
+# 安装构建基础工具
 RUN apt update && apt install -y git
 
 COPY . .
 
-RUN poetry self add poetry-dynamic-versioning && \
-    poetry config virtualenvs.in-project true && \
-    # 强制同步 lock 文件哈希以适配 pyproject.toml 的修改
-    poetry lock --no-update && \
-    poetry install && \
+# 全面切换为 pip 安装，避开 poetry.lock 哈希冲突
+RUN python -m pip install --upgrade pip && \
+    python -m pip install . poetry-dynamic-versioning && \
     rm -rf /app/.git
 
 
@@ -22,7 +17,10 @@ FROM python:3.12-slim AS runner
 
 WORKDIR /app
 
-COPY --from=builder /app/ /app/
+# 从 builder 阶段拷贝已安装依赖的 python 环境（位于 site-packages）
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin/javsp /usr/local/bin/javsp
+COPY --from=builder /app /app
 
-ENTRYPOINT ["/app/.venv/bin/javsp"]
+ENTRYPOINT ["javsp"]
 CMD ["-i", "/video"]

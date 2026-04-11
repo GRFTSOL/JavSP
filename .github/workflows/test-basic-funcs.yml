@@ -27,30 +27,25 @@ jobs:
       with:
         submodules: 'true'
 
-    - name: Install poetry
-      run: pipx install poetry
-
     - name: Setup Python 3.10
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-        cache: 'poetry'
-    - name: Setup dynamic versioning
-      run: poetry self add poetry-dynamic-versioning
-    - name: Install dependencies
+
+    - name: Install dependencies (Pip-based for stability)
       run: |
-        # 强制同步 lock 文件哈希以适配 pyproject.toml 的修改
-        poetry lock --no-update
-        poetry install
+        python -m pip install --upgrade pip
+        python -m pip install . pytest poetry-dynamic-versioning
+
     - name: Test avid.py
       run: |
-        poetry run pytest unittest/test_avid.py
+        pytest unittest/test_avid.py
     - name: Test file.py
       run: |
-        poetry run pytest unittest/test_file.py
+        pytest unittest/test_file.py
     - name: Test func.py
       run: |
-        poetry run pytest unittest/test_func.py
+        pytest unittest/test_func.py
     - name: Upload log as artifact
       uses: actions/upload-artifact@v4
       if: ${{ always() }}
