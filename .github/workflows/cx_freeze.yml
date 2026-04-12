@@ -19,12 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux
           - os: windows-latest
             platform: windows
-          - os: macos-latest
-            platform: macos
 
     steps:
       - uses: actions/checkout@v4

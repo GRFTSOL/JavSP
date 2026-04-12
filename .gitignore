@@ -145,3 +145,6 @@ config.ini
 dist/
 build/
 *.spec
+.playwright-cli/
+temp_bundle/
+unittest/integration/test_movie/#整理完成/
