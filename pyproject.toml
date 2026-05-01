@@ -5,6 +5,7 @@ description = "汇总多站点数据的AV元数据刮削器"
 authors = ["Yuukiy <76897913+Yuukiy@users.noreply.github.com>"]
 license = "GPL-3.0-only"
 readme = "README.md"
+include = ["data/**/*", "image/**/*", "config.yml"]
 
 [tool.poetry-dynamic-versioning]
 enable = true
@@ -28,6 +29,7 @@ lxml = {extras = ["html-clean"], version = "^5.2.1"}
 confz = "^2.0.1"
 pydantic-extra-types = "^2.9.0"
 pendulum = "^3.0.0"
+packaging = "^24.0"
 # slimeface 编译在 macOS ARM 下存在兼容性问题，目前设为 Windows 专用
 slimeface = {version = "^2024.9.27", markers = "sys_platform == 'win32'"}
 
