@@ -235,6 +235,7 @@ def get_config_source():
 
     parser = ArgumentParser(prog='JavSP', description='汇总多站点数据的AV元数据刮削器', formatter_class=RawTextHelpFormatter)
     parser.add_argument('-c', '--config', help='使用指定的配置文件')
+    parser.add_argument('-i', '--input-directory', help='待整理文件夹路径')
     args, _ = parser.parse_known_args()
     
     sources = []
@@ -258,6 +259,13 @@ def get_config_source():
             config_file = local_config
             
     sources.append(FileSource(file=config_file))
+
+    # 命令行手动覆盖优先 (支持 -i 简写)
+    if args.input_directory:
+        with open('override.yml', 'w') as f:
+            f.write(f"scanner:\n  input_directory: {args.input_directory}\n")
+        sources.append(FileSource(file='override.yml'))
+    
     sources.append(EnvSource(prefix='JAVSP_', allow_all=True))
     sources.append(CLArgSource(prefix='o'))
     return sources

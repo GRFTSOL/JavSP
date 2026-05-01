@@ -25,6 +25,7 @@ except ImportError:
 
 from javsp.web.base import *
 from javsp.lib import re_escape, resource_path
+from javsp.prompt import prompt
 
 __all__ = ['select_folder', 'get_scan_dir', 'remove_trail_actor_in_title',
            'shutdown', 'CLEAR_LINE', 'check_update', 'split_by_punc']

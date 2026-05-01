@@ -3,30 +3,44 @@ name: Build and Push Docker image
 on:
   workflow_dispatch:
   push:
+    branches:
+      - 'master'
+      - 'main'
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - 'master'
+      - 'main'
 
 env:
-  # Use docker.io for Docker Hub if empty
   REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
     - name: Check out code
       uses: actions/checkout@v4
       with:
-        # Fetch all history for all tags and branches
         fetch-depth: 0
 
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v2
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
       with:
-        registry: ghcr.io
+        registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,6 +49,11 @@ jobs:
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=ref,event=branch
+          type=sha,prefix=sha-
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -42,5 +61,8 @@ jobs:
         context: .
         file: ./docker/Dockerfile
         push: ${{ github.event_name != 'pull_request' }}
+        platforms: linux/amd64,linux/arm64
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
