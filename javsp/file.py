@@ -163,10 +163,13 @@ def get_failed_when_scan():
 
 
 _PARDIR_REPLACE = re.compile(r'\.{2,}')
+# 换行、制表符等控制字符不允许出现在文件路径中（如翻译引擎返回的多行标题）
+_CONTROL_CHARS_REPLACE = re.compile(r'[\x00-\x1f\x7f]+')
 def replace_illegal_chars(name):
     """将不能用于文件名的字符替换为形近的字符"""
+    name = _CONTROL_CHARS_REPLACE.sub(' ', name)
     # 非法字符列表 https://stackoverflow.com/a/31976060/6415337
-    if platform == 'win32': 
+    if platform == 'win32':
         # http://www.unicode.org/Public/security/latest/confusables.txt
         charmap = {'<': '❮',
                    '>': '❯',
