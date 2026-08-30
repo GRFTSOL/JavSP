@@ -218,20 +218,208 @@ def fetch_cookies_from_cdp(port: int = 9222) -> dict[str, str]:
         return {}
 
 
-def interactive_fetch_cookie(target_url: str = 'https://javdb.com', port: int = 9222, timeout: int = 180) -> str:
-    """Launch isolated Chromium browser window for user verification and auto extract cookie string"""
-    browser_bin = find_executable_browser()
-    if not browser_bin or not Path(browser_bin).exists():
-        logger.error("No valid Chromium-based browser (Edge/Chrome/Chromium/Brave) found on system.")
-        return ""
+def _pick_free_port() -> int:
+    """Pick a free local port to avoid collision with other apps or concurrent runs."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
 
-    temp_dir = Path(tempfile.gettempdir()) / 'javsp_edge_cdp_session'
-    if temp_dir.exists():
+
+class _CdpWs:
+    """Minimal WebSocket client for CDP request/response calls (events are skipped)"""
+
+    def __init__(self, ws_url: str, port: int):
+        self.sock = socket.create_connection(('127.0.0.1', port), timeout=10)
+        path = '/' + ws_url.split('/', 3)[3]
+        key = base64.b64encode(os.urandom(16)).decode('utf-8')
+        req_str = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(req_str.encode('utf-8'))
+        resp = b''
+        while b'\r\n\r\n' not in resp:
+            chunk = self.sock.recv(1024)
+            if not chunk:
+                raise ConnectionError('WebSocket handshake failed')
+            resp += chunk
+        if b'101' not in resp.split(b'\r\n', 1)[0]:
+            raise ConnectionError(f'WebSocket handshake rejected: {resp[:120]!r}')
+        self._next_id = 0
+
+    def call(self, method: str, params: dict | None = None, timeout: float = 10):
+        """Send a CDP command and wait for the response with the matching id"""
+        self._next_id += 1
+        mid = self._next_id
+        send_ws_message(self.sock, json.dumps({'id': mid, 'method': method, 'params': params or {}}))
+        self.sock.settimeout(timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                raw = recv_ws_message(self.sock)
+            except socket.timeout:
+                raise TimeoutError(f'CDP call timeout: {method}')
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get('id') == mid:
+                if 'error' in msg:
+                    raise RuntimeError(f"CDP error: {msg['error']}")
+                return msg.get('result', {})
+            # 其他消息（事件/其他请求的响应）直接忽略
+        raise TimeoutError(f'CDP call timeout: {method}')
+
+    def close(self):
         try:
-            shutil.rmtree(temp_dir)
+            self.sock.close()
         except Exception:
             pass
 
+
+class CdpBrowser:
+    """Persistent Chromium instance driven via CDP for fetching pages blocked by Cloudflare.
+
+    所有请求都由真实浏览器发出（天然携带正确的 TLS/HTTP2 指纹和过盾状态），
+    导航完成后提取渲染好的 HTML 交给 lxml 解析。
+    """
+
+    def __init__(self):
+        self.port: int | None = None
+        self.proc: subprocess.Popen | None = None
+        self.temp_dir: Path | None = None
+
+    def ensure_started(self) -> None:
+        if self.proc is not None and self.proc.poll() is None and self.port:
+            return
+        browser_bin = find_executable_browser()
+        if not browser_bin or not Path(browser_bin).exists():
+            raise RuntimeError('No valid Chromium-based browser found on system.')
+        self.port = _pick_free_port()
+        self.temp_dir = Path(tempfile.mkdtemp(prefix='javsp_cdp_run_'))
+        cmd = [
+            browser_bin,
+            f'--remote-debugging-port={self.port}',
+            f'--user-data-dir={self.temp_dir}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            # 阻止 Edge 用 Windows 账号静默登录后弹同步提示框干扰验证
+            '--disable-sync',
+            '--disable-features=msImplicitSignin,msSignInPromo',
+            'about:blank'
+        ]
+        self.proc = subprocess.Popen(cmd)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f'http://127.0.0.1:{self.port}/json/version', timeout=2)
+                return
+            except Exception:
+                if self.proc.poll() is not None:
+                    raise RuntimeError('Browser process exited unexpectedly during CDP startup')
+                time.sleep(0.5)
+        raise RuntimeError('CDP endpoint did not become ready in time')
+
+    def fetch_html(self, url: str, timeout: float = 60) -> str | None:
+        """Navigate a new tab to url and return rendered HTML, or None if not ready in time.
+
+        遇到 Cloudflare 挑战页时会持续等待，用户可在弹出的窗口中手动完成验证。
+        """
+        self.ensure_started()
+        # 新建标签页（Chrome 111+ 要求 PUT，旧版本接受 GET）
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{self.port}/json/new?about:blank', method='PUT')
+            tab = json.loads(urllib.request.urlopen(req, timeout=5).read().decode('utf-8'))
+        except Exception:
+            tab = json.loads(urllib.request.urlopen(
+                f'http://127.0.0.1:{self.port}/json/new?about:blank', timeout=5).read().decode('utf-8'))
+        tab_id, ws_url = tab['id'], tab['webSocketDebuggerUrl']
+        ws = None
+        try:
+            ws = _CdpWs(ws_url, self.port)
+            ws.call('Page.enable')
+            ws.call('Page.navigate', {'url': url})
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                time.sleep(1)
+                try:
+                    # 先确认导航已离开初始空白页，避免抓到空白文档
+                    loc = ws.call('Runtime.evaluate',
+                                  {'expression': 'location.href', 'returnByValue': True}, timeout=8)
+                    if 'about:blank' in (loc.get('result', {}).get('value') or ''):
+                        continue
+                    state = ws.call('Runtime.evaluate',
+                                    {'expression': 'document.readyState', 'returnByValue': True}, timeout=8)
+                    if state.get('result', {}).get('value') != 'complete':
+                        continue
+                    html_res = ws.call('Runtime.evaluate',
+                                       {'expression': 'document.documentElement.outerHTML', 'returnByValue': True},
+                                       timeout=15)
+                    text = html_res.get('result', {}).get('value') or ''
+                    # 内容过短视为导航尚未完成
+                    if len(text) < 500:
+                        continue
+                    # Cloudflare 挑战页特征：等待自动通过或用户手动完成
+                    if 'Just a moment' in text or 'cf-chl' in text:
+                        logger.debug('CDP fetch: Cloudflare challenge page, waiting...')
+                        continue
+                    return text
+                except (TimeoutError, RuntimeError, ConnectionError, socket.timeout) as e:
+                    logger.debug(f'CDP poll error (will retry): {e}')
+            logger.warning(f'CDP fetch timed out after {timeout}s: {url}')
+            return None
+        finally:
+            if ws is not None:
+                ws.close()
+            try:
+                urllib.request.urlopen(f'http://127.0.0.1:{self.port}/json/close/{tab_id}', timeout=5)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        self.proc = None
+        self.port = None
+        if self.temp_dir is not None:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self.temp_dir = None
+
+
+def _get_browser_ua(port: int) -> str | None:
+    """Fetch the browser's real User-Agent via CDP (cf_clearance is UA-bound)"""
+    try:
+        req = urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=2)
+        info = json.loads(req.read().decode('utf-8'))
+        return info.get('User-Agent')
+    except Exception as e:
+        logger.debug(f"Failed to fetch browser UA: {e}")
+        return None
+
+
+def interactive_fetch_cookie_full(target_url: str = 'https://javdb.com', port: int | None = None, timeout: int = 180) -> tuple[str, str | None]:
+    """Launch isolated Chromium browser, wait for real Cloudflare clearance, return (cookie_str, user_agent)"""
+    if port is None:
+        port = _pick_free_port()
+    browser_bin = find_executable_browser()
+    if not browser_bin or not Path(browser_bin).exists():
+        logger.error("No valid Chromium-based browser (Edge/Chrome/Chromium/Brave) found on system.")
+        return "", None
+
+    temp_dir = Path(tempfile.mkdtemp(prefix='javsp_cdp_'))
     cmd = [
         browser_bin,
         f'--remote-debugging-port={port}',
@@ -242,54 +430,82 @@ def interactive_fetch_cookie(target_url: str = 'https://javdb.com', port: int = 
     ]
 
     logger.info("=" * 60)
-    logger.info("JavSP: 正在启动内置 Edge 浏览器窗口进行过盾/登录...")
-    logger.info("提示: 请在弹出的浏览器窗口中完成 Cloudflare 验证或登录 JavDB。")
-    logger.info("验证成功后，本工具会自动捕获凭证并关闭浏览器窗口。")
+    logger.info("JavSP: 正在启动浏览器窗口进行 Cloudflare 过盾...")
+    logger.info("提示: 请在弹出的窗口中完成人机验证（出现 JavDB 页面内容即成功）。")
+    logger.info("如需抓取 FC2 等登录后可见的内容，请趁窗口打开时登录 JavDB 账号。")
+    logger.info("过盾（以及登录，若进行）完成后，本工具会自动捕获凭证并关闭浏览器窗口。")
     logger.info("=" * 60)
 
     proc = subprocess.Popen(cmd)
     start_time = time.time()
     cookies_dict = {}
+    user_agent = None
+    anonymous_session = None  # 首次捕获到过盾凭证时的匿名 _jdb_session，用于判断登录状态变化
 
     try:
         while time.time() - start_time < timeout:
             time.sleep(2)
             c_dict = fetch_cookies_from_cdp(port)
-            if '_jdb_session' in c_dict or 'cf_clearance' in c_dict:
-                logger.info("成功检测并捕获到有效的 JavDB 过盾/登录 Cookie!")
+            if 'cf_clearance' not in c_dict:
+                # JavDB 对匿名访客也会下发 _jdb_session，它不能用于过盾，忽略之并继续等待
+                if proc.poll() is not None:
+                    logger.warning("用户手动关闭了浏览器窗口。")
+                    break
+                continue
+            if not cookies_dict:
+                cookies_dict = c_dict
+                user_agent = _get_browser_ua(port)
+                anonymous_session = c_dict.get('_jdb_session')
+                logger.info("成功检测到 Cloudflare 过盾凭证 (cf_clearance)!")
+            if anonymous_session and c_dict.get('_jdb_session') != anonymous_session:
+                logger.info("检测到登录成功 (会话已更新)!")
                 cookies_dict = c_dict
                 break
-
             if proc.poll() is not None:
                 logger.warning("用户手动关闭了浏览器窗口。")
                 break
     finally:
         if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         if temp_dir.exists():
             try:
-                shutil.rmtree(temp_dir)
+                shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
                 pass
 
     if cookies_dict:
         cookie_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-        return cookie_str
-    return ""
+        return cookie_str, user_agent
+    return "", None
+
+
+def interactive_fetch_cookie(target_url: str = 'https://javdb.com', port: int | None = None, timeout: int = 180) -> str:
+    """Launch isolated Chromium browser window for user verification and auto extract cookie string"""
+    cookie_str, _ = interactive_fetch_cookie_full(target_url, port=port, timeout=timeout)
+    return cookie_str
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     print("正在启动 JavDB 登录/过盾弹窗助手...")
-    c_str = interactive_fetch_cookie("https://javdb.com")
+    c_str, c_ua = interactive_fetch_cookie_full("https://javdb.com")
     if c_str:
         print("\n" + "=" * 60)
         print("提取成功! 捕获的 JavDB Cookie:")
         print(c_str)
+        if c_ua:
+            print("浏览器 UA:")
+            print(c_ua)
         print("=" * 60)
         from javsp.config import save_javdb_cookie_to_config
-        save_javdb_cookie_to_config(c_str)
-        print("已自动将 Cookie 写入配置文件 config.yml 和 dist/config.yml")
+        save_javdb_cookie_to_config(c_str, c_ua)
+        print("已自动将 Cookie 和 UA 写入配置文件 config.yml 和 dist/config.yml")
     else:
         print("未能捕获到 Cookie 或操作超时/关闭。")

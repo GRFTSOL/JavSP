@@ -123,6 +123,8 @@ class Crawler(BaseConfig):
     use_javdb_cover: UseJavDBCover
     normalize_actress_name: bool
     javdb_cookie: str | None = None
+    # cf_clearance 与 User-Agent 绑定，需与 javdb_cookie 一并保存
+    javdb_ua: str | None = None
 
 class MovieDefault(BaseConfig):
     title: str
@@ -276,15 +278,17 @@ def get_config_source():
     return sources
 
 
-def save_javdb_cookie_to_config(cookie_str: str) -> None:
-    """Save the acquired javdb_cookie string to active config files and update memory state"""
+def save_javdb_cookie_to_config(cookie_str: str, ua: str | None = None) -> None:
+    """Save the acquired javdb_cookie string (and its bound UA) to active config files and update memory state"""
     import re
     if not cookie_str:
         return
-    
+
     # Update active Cfg memory instance
     try:
         Cfg().crawler.javdb_cookie = cookie_str
+        if ua:
+            Cfg().crawler.javdb_ua = ua
     except Exception:
         pass
 
@@ -296,6 +300,7 @@ def save_javdb_cookie_to_config(cookie_str: str) -> None:
         if os.path.exists(candidate):
             target_files.add(candidate)
 
+    ua_line = f'  javdb_ua: "{ua}"' if ua else None
     for cfg_file in target_files:
         try:
             with open(cfg_file, 'r', encoding='utf-8') as f:
@@ -313,6 +318,22 @@ def save_javdb_cookie_to_config(cookie_str: str) -> None:
                     f'\\1  javdb_cookie: "{cookie_str}"\n',
                     content
                 )
+            # 同步写入与 cookie 绑定的 User-Agent
+            if ua_line:
+                if re.search(r'^\s*#?\s*javdb_ua:', new_content, re.MULTILINE):
+                    new_content = re.sub(
+                        r'^\s*#?\s*javdb_ua:.*',
+                        ua_line,
+                        new_content,
+                        flags=re.MULTILINE
+                    )
+                else:
+                    new_content = re.sub(
+                        r'^(\s*javdb_cookie:.*\n)',
+                        f'\\1{ua_line}\n',
+                        new_content,
+                        flags=re.MULTILINE
+                    )
             with open(cfg_file, 'w', encoding='utf-8') as f:
                 f.write(new_content)
         except Exception:

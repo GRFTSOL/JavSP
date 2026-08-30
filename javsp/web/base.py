@@ -121,11 +121,17 @@ class Request():
         return r
 
     def head(self, url, delay_raise=True):
-        r = self.__head(url,
-                      headers=self.headers,
-                      proxies=self.proxies,
-                      cookies=self.cookies,
-                      timeout=self.timeout)
+        kwargs = {
+            "headers": self.headers,
+            "proxies": self.proxies,
+            "cookies": self.cookies,
+            "timeout": self.timeout
+        }
+        if self.use_impersonate:
+            kwargs["impersonate"] = "chrome110"
+            if self.proxies:
+                kwargs["proxies"] = { "http": str(Cfg().network.proxy_server), "https": str(Cfg().network.proxy_server) }
+        r = self.__head(url, **kwargs)
         if not delay_raise:
             r.raise_for_status()
         return r

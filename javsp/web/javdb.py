@@ -2,6 +2,8 @@
 import os
 import re
 import logging
+import threading
+from datetime import date
 
 from javsp.web.base import Request, resp2html
 from javsp.web.exceptions import *
@@ -9,8 +11,13 @@ from javsp.func import *
 from javsp.avid import guess_av_type
 from javsp.datatype import MovieInfo, GenreMap
 from javsp.chromium import get_browsers_cookies
-from javsp.cdp_cookie import interactive_fetch_cookie
 from javsp.config import Cfg, CrawlerID, save_javdb_cookie_to_config
+
+# 全局熔断与并发保护
+_javdb_cookies_pool_lock = threading.Lock()
+_javdb_cdp_lock = threading.Lock()
+_cdp_browser = None  # 持久浏览器实例，懒加载
+_MAX_WRAPPER_DEPTH = 3
 
 
 # 初始化Request实例。使用 use_impersonate=True 绕过 Cloudflare 的 TLS 指纹识别
@@ -34,7 +41,8 @@ permanent_url = 'https://javdb.com'
 if Cfg().network.proxy_server is not None:
     base_url = permanent_url
 else:
-    base_url = str(Cfg().network.proxy_free[CrawlerID.javdb])
+    # rstrip 去掉 pydantic Url 归一化带来的尾部斜杠，避免拼出 //search 之类的双斜杠 URL
+    base_url = str(Cfg().network.proxy_free[CrawlerID.javdb]).rstrip('/')
 
 
 def parse_cookie_str(cookie_str: str) -> dict:
@@ -50,91 +58,122 @@ def parse_cookie_str(cookie_str: str) -> dict:
     return cookies
 
 
-def get_html_wrapper(url):
-    """包装外发的request请求并负责转换为可xpath的html，同时处理Cookies无效等问题"""
-    global request, cookies_pool
-    # Priority: apply manually configured javdb_cookie from Cfg if available
+def _pop_cookies_pool():
+    """Thread-safe pop from cookies_pool; returns item or None."""
+    global cookies_pool
+    with _javdb_cookies_pool_lock:
+        if 'cookies_pool' not in globals() or len(cookies_pool) == 0:
+            try:
+                cookies_pool = get_browsers_cookies()
+            except Exception as e:
+                logger.debug(f"读取浏览器Cookies失败: {e}")
+                cookies_pool = []
+        if len(cookies_pool) > 0:
+            return cookies_pool.pop()
+    return None
+
+
+def _apply_manual_cookie() -> None:
+    """Apply manually configured javdb_cookie and its bound UA from Cfg if available"""
     manual_cookie = getattr(Cfg().crawler, 'javdb_cookie', None)
     if manual_cookie and not request.cookies:
         request.cookies = parse_cookie_str(manual_cookie)
+        # cf_clearance 与 UA 绑定，一并应用保存的 UA
+        manual_ua = getattr(Cfg().crawler, 'javdb_ua', None)
+        if manual_ua:
+            request.headers['User-Agent'] = manual_ua
+
+
+def _cdp_fetch_html(url):
+    """通过持久浏览器(CDP)抓取被 Cloudflare 拦截的页面，返回 lxml document 或 None"""
+    global _cdp_browser
+    with _javdb_cdp_lock:
+        try:
+            if _cdp_browser is None:
+                import atexit
+                from javsp.cdp_cookie import CdpBrowser
+                _cdp_browser = CdpBrowser()
+                atexit.register(_cdp_browser.stop)
+                logger.info('JavDB 被拦截，已启动浏览器直连模式（窗口保持打开，遇到人机验证时可手动点击）')
+            text = _cdp_browser.fetch_html(url, timeout=120)
+        except Exception as e:
+            logger.warning(f'CDP 浏览器抓取失败: {e}')
+            return None
+    if text:
+        import lxml.html
+        html = lxml.html.fromstring(text)
+        html.make_links_absolute(url, resolve_base_href=True)
+        return html
+    return None
+
+
+def get_html_wrapper(url, _depth: int = 0):
+    """包装外发的request请求并负责转换为可xpath的html，同时处理Cookies无效等问题"""
+    global request
+    if _depth > _MAX_WRAPPER_DEPTH:
+        raise SiteBlocked(f'JavDB: 达到最大重试深度，停止重试: {url}')
+    # Priority: apply manually configured javdb_cookie from Cfg if available
+    _apply_manual_cookie()
 
     try:
         r = request.get(url, delay_raise=True)
     except Exception as e:
         logger.debug(f"JavDB 请求异常: {e}")
-        # 尝试自动刷新一次 Cookies 库
-        if 'cookies_pool' not in globals() or len(cookies_pool) == 0:
-            try:
-                cookies_pool = get_browsers_cookies()
-            except:
-                cookies_pool = []
-        
-        if len(cookies_pool) > 0:
-            item = cookies_pool.pop()
+        item = _pop_cookies_pool()
+        if item is not None:
             request.cookies = item['cookies']
             logger.debug(f'请求异常，尝试使用浏览器 Cookies: {item["profile"]}')
-            return get_html_wrapper(url)
+            return get_html_wrapper(url, _depth + 1)
+        # 网络层面异常时也尝试浏览器直连
+        html = _cdp_fetch_html(url)
+        if html is not None:
+            return html
         raise
 
     if r.status_code == 200:
         # 发生重定向可能仅仅是域名重定向，因此还要检查url以判断是否被跳转到了登录页
         if r.history and '/login' in r.url:
-            # 仅在需要时去读取Cookies
-            if 'cookies_pool' not in globals() or len(cookies_pool) == 0:
-                try:
-                    cookies_pool = get_browsers_cookies()
-                except Exception as e:
-                    logger.debug(f"读取浏览器Cookies失败: {e}")
-                    cookies_pool = []
-            if len(cookies_pool) > 0:
-                item = cookies_pool.pop()
+            item = _pop_cookies_pool()
+            if item is not None:
                 request.cookies = item['cookies']
                 logger.debug(f'发现登录重定向，尝试更换Cookies为: {item["profile"]}')
-                return get_html_wrapper(url)
+                return get_html_wrapper(url, _depth + 1)
             else:
                 raise CredentialError('JavDB: 需要登录访问，且未在本地浏览器找到有效会话。请在浏览器登录 JavDB 后再试。')
         elif r.history and 'pay' in r.url.split('/')[-1]:
             raise SitePermissionError(f"JavDB: 此资源被限制为仅VIP可见: '{r.history[0].url}'")
         else:
             html = resp2html(r)
+            # JavDB 对未登录用户以 200 返回标题为“登入”的拦截页（如 FC2 影片页现已要求登录）
+            titles = html.xpath('//title/text()')
+            if titles and '登入' in titles[0]:
+                raise CredentialError(
+                    f'JavDB: 该内容需要登录后访问: {url} '
+                    f'(可运行 "python -m javsp.cdp_cookie" 重新过盾并登录 JavDB 后更新 Cookie)')
             return html
     elif r.status_code in (403, 503):
-        # Try automatically using/switching browser cookies when encountering 403/503
-        if 'cookies_pool' not in globals() or len(cookies_pool) == 0:
-            try:
-                cookies_pool = get_browsers_cookies()
-            except Exception as e:
-                logger.debug(f"Failed to read browser cookies: {e}")
-                cookies_pool = []
-        if len(cookies_pool) > 0:
-            item = cookies_pool.pop()
+        # 先尝试浏览器 Cookie 池
+        item = _pop_cookies_pool()
+        if item is not None:
             request.cookies = item['cookies']
             logger.debug(f'Encountered 403/503 block, attempting to use browser cookies: {item["profile"]}')
-            return get_html_wrapper(url)
+            return get_html_wrapper(url, _depth + 1)
 
-        # Launch interactive Edge browser popup via CDP to fetch cookies
-        try:
-            new_cookie_str = interactive_fetch_cookie(url)
-            if new_cookie_str:
-                request.cookies = parse_cookie_str(new_cookie_str)
-                save_javdb_cookie_to_config(new_cookie_str)
-                logger.info("Successfully acquired cookies via browser popup and saved to config file. Retrying request...")
-                return get_html_wrapper(url)
-        except Exception as e:
-            logger.debug(f"Failed interactive cookie extraction: {e}")
+        # Cookie 池无法过盾：改由真实浏览器直接抓取（指纹天然过盾）
+        html = _cdp_fetch_html(url)
+        if html is not None:
+            return html
 
-        html = resp2html(r)
-        code_tag = html.xpath("//span[@class='code-label']/span")
+        code_tag = html.xpath("//span[@class='code-label']/span") if html is not None else []
         error_code = code_tag[0].text if code_tag else None
-        
+
         # 针对 Cloudflare 403 的特殊引导
         if r.status_code == 403:
             logger.error("\n" + "!"*60)
-            logger.error("JavDB: 触发了 Cloudflare 强力拦截 (403 Forbidden)")
-            logger.error("对策: 请确保您的代理可用，或在浏览器中打开一次 https://javdb.com 过验证")
-            logger.error("提示: 若要彻底解决，请在浏览器中【登录】JavDB，JavSP 会自动同步您的登录状态")
+            logger.error("JavDB: 触发了 Cloudflare 强力拦截 (403 Forbidden)，且浏览器直连未能完成验证")
+            logger.error("对策: 请确保您的代理可用，或在弹出的浏览器窗口中完成一次人机验证")
             logger.error("!"*60 + "\n")
-            
+
         if error_code:
             if error_code == '1020':
                 block_msg = f'JavDB: {r.status_code} 禁止访问: 站点屏蔽了来自日本地区的IP地址，请使用其他地区的代理服务器'
@@ -185,27 +224,38 @@ def parse_data(movie: MovieInfo):
     html = get_html_wrapper(f'{base_url}/search?q={movie.dvdid}')
     ids = list(map(str.lower, html.xpath("//div[@class='video-title']/strong/text()")))
     movie_urls = html.xpath("//a[@class='box']/@href")
-    match_count = len([i for i in ids if i == movie.dvdid.lower()])
-    if match_count == 0:
+    boxes = html.xpath("//a[@class='box']")
+    match_indices = [i for i, vid in enumerate(ids) if vid == movie.dvdid.lower()]
+    if not match_indices:
         raise MovieNotFoundError(__name__, movie.dvdid, ids)
-    elif match_count == 1:
-        index = ids.index(movie.dvdid.lower())
-        new_url = movie_urls[index]
-        try:
-            html2 = get_html_wrapper(new_url)
-        except (SitePermissionError, CredentialError):
-            # 不开VIP不让看，过分。决定榨出能获得的信息，毕竟有时候只有这里能找到标题和封面
-            box = html.xpath("//a[@class='box']")[index]
-            movie.url = new_url
-            movie.title = box.get('title')
-            movie.cover = box.xpath("div/img/@src")[0]
-            score_str = box.xpath("div[@class='score']/span/span")[0].tail
-            score = re.search(r'([\d.]+)分', score_str).group(1)
-            movie.score = "{:.2f}".format(float(score)*2)
-            movie.publish_date = box.xpath("div[@class='meta']/text()")[0].strip()
-            return
+    elif len(match_indices) > 1:
+        # 不同片商可能复用同一番号（如新旧时代撞号），挑选发行日期最新的条目
+        def box_date(i):
+            meta = boxes[i].xpath("div[@class='meta']/text()")
+            try:
+                return date.fromisoformat(meta[0].strip()) if meta else date.min
+            except ValueError:
+                return date.min
+        index = max(match_indices, key=box_date)
+        dates = [box_date(i).isoformat() for i in match_indices]
+        logger.info(f'JavDB: 番号 {movie.dvdid} 有 {len(match_indices)} 个匹配条目（发行日期 {dates}），选用最新的一个')
     else:
-        raise MovieDuplicateError(__name__, movie.dvdid, match_count)
+        index = match_indices[0]
+    new_url = movie_urls[index]
+    try:
+        html2 = get_html_wrapper(new_url)
+    except (SitePermissionError, CredentialError):
+        # 不开VIP不让看（FC2页现已要求登录）。决定榨出能获得的信息，毕竟有时候只有这里能找到标题和封面
+        box = boxes[index]
+        movie.url = new_url
+        movie.title = box.get('title')
+        movie.cover = box.xpath("div/img/@src")[0]
+        score_tag = box.xpath("div[@class='score']/span/span")
+        if score_tag:
+            score = re.search(r'([\d.]+)分', score_tag[0].tail).group(1)
+            movie.score = "{:.2f}".format(float(score)*2)
+        movie.publish_date = box.xpath("div[@class='meta']/text()")[0].strip()
+        return
 
     container = html2.xpath("/html/body/section/div/div[@class='video-detail']")[0]
     info = container.xpath("//nav[@class='panel movie-panel-info']")[0]
@@ -398,31 +448,15 @@ def collect_actress_alias(type=0, use_original=True):
 
 
 def ensure_javdb_cookie_ready() -> None:
-    """Pre-check JavDB cookie once at startup before batch processing starts"""
-    global request
-    manual_cookie = getattr(Cfg().crawler, 'javdb_cookie', None)
-    if manual_cookie:
-        request.cookies = parse_cookie_str(manual_cookie)
-        return
-
-    # Try quick request to check whether JavDB is blocked by Cloudflare 403
+    """Pre-check JavDB reachability once at startup before batch processing starts"""
+    _apply_manual_cookie()
     try:
         r = request.get(f'{base_url}/search?q=test', delay_raise=True)
         if r.status_code == 200:
             return
+        logger.info(f'JavDB 预检: HTTP {r.status_code}，抓取时将自动切换为浏览器直连模式')
     except Exception:
-        pass
-
-    # Trigger browser popup ONCE at start
-    logger.info("JavDB 防护预检：未在配置中检测到有效 Cookie，正在开头发起一次性过盾/登录...")
-    try:
-        new_cookie_str = interactive_fetch_cookie(base_url)
-        if new_cookie_str:
-            request.cookies = parse_cookie_str(new_cookie_str)
-            save_javdb_cookie_to_config(new_cookie_str)
-            logger.info("已成功在开局获取 JavDB Cookie 并写入配置文件！后续整理将不再弹出窗口。")
-    except Exception as e:
-        logger.debug(f"Start precheck cookie fetch failed: {e}")
+        logger.info('JavDB 预检请求失败，抓取时将自动切换为浏览器直连模式')
 
 
 if __name__ == "__main__":
